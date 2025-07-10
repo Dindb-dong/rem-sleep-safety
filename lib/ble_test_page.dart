@@ -22,25 +22,32 @@ class BleTestPage extends StatefulWidget {
 
 class _BleTestPageState extends State<BleTestPage> {
   BluetoothDevice? _device;
-  BluetoothCharacteristic? _characteristic;
+  BluetoothCharacteristic? _txCharacteristic;
+  BluetoothCharacteristic? _rxCharacteristic;
   bool _isConnected = false;
   final List<String> _receivedData = [];
   String? _safety1ch;
   StreamSubscription<List<ScanResult>>? _scanSubscription;
   final List<String> _logs = []; // 로그 저장용
+  final List<List<int>> _batchReceivedData = [];
+  Timer? _batchTimer;
+  bool _batchTimerStarted = false;
 
   // NUS UUID 정의
-  final Guid nusServiceUuid = Guid("6e406000-b5a3-f393-e0a9-e50e24dcca9e");
-  final Guid nusTxCharUuid = Guid("6e406003-b5a3-f393-e0a9-e50e24dcca9e");
-  final Guid nusRxCharUuid = Guid("6e406002-b5a3-f393-e0a9-e50e24dcca9e");
+  final Guid nusServiceUuid = Guid("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
+  final Guid nusTxCharUuid = Guid("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
+  final Guid nusRxCharUuid = Guid("6e400002-b5a3-f393-e0a9-e50e24dcca9e");
 
-  void _addLog(String message) {
+  void _addLog(String message, {bool printLog = false}) {
     final timestamp = DateTime.now().toString().substring(11, 19); // HH:MM:SS
     setState(() {
       _logs.insert(0, "[$timestamp] $message");
-      if (_logs.length > 50) _logs.removeLast(); // 최대 50개 로그만 유지
+      if (_logs.length > 100) _logs.removeLast(); // 최대 100개 로그만 유지
     });
-    print("[BLE_LOG] $message"); // 콘솔에도 출력
+    if (printLog) {
+      // ignore: avoid_print
+      print("[BLE_LOG] $message"); // 콘솔에도 출력
+    }
   }
 
   void _connect() {
@@ -59,13 +66,12 @@ class _BleTestPageState extends State<BleTestPage> {
         ? r.device.platformName
         : r.device.remoteId.toString();
 
-    _addLog("📱 기기 발견: $deviceName (${r.device.remoteId})");
-    _addLog("   - RSSI: ${r.rssi} dBm");
-    _addLog("   - 서비스 UUID 개수: ${r.advertisementData.serviceUuids.length}");
+    _addLog("기기 발견: $deviceName (${r.device.remoteId})");
+    _addLog("   - RSSI:  ${r.rssi} dBm");
+    _addLog("   - 서비스 UUID 개수:  ${r.advertisementData.serviceUuids.length}");
 
-    // UUID 기반으로 서비스가 있는 기기만 연결
-    final serviceUuids = r.advertisementData.serviceUuids;
-    if (serviceUuids.contains(nusServiceUuid)) {
+    // NUS 서비스가 없더라도, 이름이 'Nordic_UART'라면 연결 시도
+    if (r.advertisementData.serviceUuids.contains(nusServiceUuid)) {
       _addLog("✅ NUS 서비스 발견! 연결을 시도합니다...");
       FlutterBluePlus.stopScan();
       _addLog("🛑 스캔을 중지했습니다.");
@@ -82,27 +88,32 @@ class _BleTestPageState extends State<BleTestPage> {
 
         _addLog("🔍 서비스를 탐색 중...");
         var services = await r.device.discoverServices();
-        _addLog("📋 발견된 서비스 개수: ${services.length}");
+        _addLog("📋 발견된 서비스 개수:  ${services.length}");
 
         for (var s in services) {
-          _addLog("   - 서비스: ${s.uuid}");
+          _addLog("   - 서비스:  ${s.uuid}");
           if (s.uuid == nusServiceUuid) {
             _addLog("✅ NUS 서비스를 찾았습니다!");
-            _addLog("   - 캐릭터리스틱 개수: ${s.characteristics.length}");
+            _addLog("   - 캐릭터리스틱 개수:  ${s.characteristics.length}");
 
             for (var c in s.characteristics) {
-              _addLog("     - 캐릭터리스틱: ${c.uuid}");
-              _addLog("       속성: ${c.properties}");
-
-              if (c.uuid == nusTxCharUuid && c.properties.notify) {
-                _addLog("✅ TX 캐릭터리스틱 발견! 알림을 활성화합니다...");
-                _characteristic = c;
+              _addLog("     - 캐릭터리스틱:  ${c.uuid}");
+              _addLog("       속성:  ${c.properties}");
+              if (c.properties.write && c.uuid == nusRxCharUuid) {
+                _addLog("✅ RX 캐릭터리스틱 발견! (쓰기용)");
+                _rxCharacteristic = c;
+              }
+              if (c.properties.notify && c.uuid == nusTxCharUuid) {
+                _addLog("✅ TX 캐릭터리스틱 발견! (알림용) 알림을 활성화합니다...", printLog: true);
+                _txCharacteristic = c;
                 await c.setNotifyValue(true);
                 _addLog("✅ 알림 활성화 완료!");
                 c.lastValueStream.listen(_onDataReceived);
                 _addLog("🎧 데이터 수신 대기 중...");
               }
             }
+          } else {
+            _addLog("UUID가 일치하지 않습니다.");
           }
         }
       } catch (e) {
@@ -110,57 +121,62 @@ class _BleTestPageState extends State<BleTestPage> {
         setState(() {
           _isConnected = false;
           _device = null;
-          _characteristic = null;
+          _txCharacteristic = null;
+          _rxCharacteristic = null;
         });
       }
     } else {
-      _addLog("❌ NUS 서비스가 없습니다. 건너뜁니다.");
+      _addLog("❌ NUS 서비스와 Nordic_UART 이름이 모두 없습니다. 건너뜁니다.");
     }
   }
 
   void _disconnect() async {
+    if (_txCharacteristic != null) {
+      await _txCharacteristic!.setNotifyValue(false);
+    }
     if (_device != null) {
-      _addLog("🔌 연결을 해제합니다...");
+      _addLog("🔌 연결을 해제합니다...", printLog: true);
       try {
         await _device!.disconnect();
-        _addLog("✅ 연결 해제 완료!");
+        _addLog("✅ 연결 해제 완료!", printLog: true);
       } catch (e) {
-        _addLog("❌ 연결 해제 실패: $e");
+        _addLog("❌ 연결 해제 실패: $e", printLog: true);
       }
     }
 
     setState(() {
       _isConnected = false;
       _device = null;
-      _characteristic = null;
+      _txCharacteristic = null;
+      _rxCharacteristic = null;
       _receivedData.clear();
       _safety1ch = null;
     });
   }
 
   void _sendStart() {
-    _addLog("▶️ Start 명령을 전송합니다...");
+    _addLog("▶️ Start 명령을 전송합니다...", printLog: true);
     _sendData([0x01, 0x0d, 0x0a]);
   }
 
   void _sendStop() {
-    _addLog("⏹️ Stop 명령을 전송합니다...");
+    _addLog("⏹️ Stop 명령을 전송합니다...", printLog: true);
     _sendData([0x02, 0x0d, 0x0a]);
   }
 
   void _sendData(List<int> bytes) async {
-    if (_characteristic != null) {
+    if (_rxCharacteristic != null) {
       try {
         _addLog(
-          "📤 데이터 전송: ${bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}",
+          "📤 데이터 전송(RX): ${bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}",
         );
-        await _characteristic!.write(Uint8List.fromList(bytes));
+        await _rxCharacteristic!.write(Uint8List.fromList(bytes));
         _addLog("✅ 데이터 전송 완료!");
       } catch (e) {
         _addLog("❌ 데이터 전송 실패: $e");
       }
     } else {
-      _addLog("❌ 캐릭터리스틱이 없습니다. 연결을 확인해주세요.");
+      _addLog("❌ RX 캐릭터리스틱이 없습니다. 연결을 확인해주세요.");
     }
   }
 
@@ -170,10 +186,10 @@ class _BleTestPageState extends State<BleTestPage> {
       "   - 데이터: ${data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}",
     );
 
-    if (data.length >= 184 &&
+    if (data.length == 183 &&
         data[0] == 0x40 &&
         data[181] == 0x0d &&
-        data[182] == 0x0d) {
+        data[182] == 0x0a) {
       String oneCh = data
           .sublist(6, 9)
           .map((b) => b.toRadixString(16).padLeft(2, '0'))
@@ -187,6 +203,21 @@ class _BleTestPageState extends State<BleTestPage> {
         );
         _safety1ch = oneCh;
       });
+
+      // 183바이트 데이터만 저장
+      _batchReceivedData.add(List<int>.from(data));
+
+      // 타이머가 없으면 시작
+      if (!_batchTimerStarted) {
+        _batchTimerStarted = true;
+        _batchTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+          if (_batchReceivedData.isNotEmpty) {
+            final toPrint = List<List<int>>.from(_batchReceivedData);
+            print(toPrint.map((arr) => arr.toString()).toList());
+            _batchReceivedData.removeRange(0, toPrint.length);
+          }
+        });
+      }
     } else {
       _addLog(
         "⚠️ 유효하지 않은 데이터 패킷 (길이: ${data.length}, 시작: 0x${data.isNotEmpty ? data[0].toRadixString(16) : 'N/A'})",
@@ -197,12 +228,13 @@ class _BleTestPageState extends State<BleTestPage> {
   @override
   void initState() {
     super.initState();
-    _addLog("앱 시작됨 (initState)");
+    _addLog("앱 시작됨 (initState)", printLog: true);
   }
 
   @override
   void dispose() {
     _scanSubscription?.cancel();
+    _batchTimer?.cancel();
     super.dispose();
   }
 
@@ -256,7 +288,7 @@ class _BleTestPageState extends State<BleTestPage> {
               ],
             ),
             SizedBox(
-              height: 180, // 고정 높이로 변경
+              height: 280, // 고정 높이로 변경
               child: Container(
                 padding: const EdgeInsets.all(8),
                 decoration: BoxDecoration(

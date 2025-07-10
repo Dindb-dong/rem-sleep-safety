@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'ble_test_page.dart';
 
 void main() {
+  print('main() called');
   runApp(const MyApp());
 }
 
